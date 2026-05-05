@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+show_help() {
+  cat <<'EOF'
+ac - lightweight git auto-commit watcher
+
+Usage:
+  ac [ROOT_DIR] [options]
+
+Arguments:
+  ROOT_DIR               Repository root to watch (default: current directory)
+
+Options:
+  -h, --help             Show this help text
+  -v, --version          Show version
+      --once             Run a single commit cycle and exit
+      --dry-run          Print what would happen without committing/pushing
+
+Environment:
+  AUTOCOMMIT_CONFIG      Override config path (default: <ROOT_DIR>/.autocom.conf)
+EOF
+}
+
+ROOT_DIR="."
+RUN_ONCE=false
+DRY_RUN=false
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -v|--version)
+      echo "ac $VERSION"
+      exit 0
+      ;;
+    --once)
+      RUN_ONCE=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      echo "Run 'ac --help' for usage." >&2
+      exit 2
+      ;;
+    *)
+      if [ "$ROOT_DIR" = "." ]; then
+        ROOT_DIR="$1"
+        shift
+      else
+        echo "Unexpected argument: $1" >&2
+        echo "Run 'ac --help' for usage." >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+ROOT_DIR="$(cd "$ROOT_DIR" && pwd)"
+CONFIG_FILE="${AUTOCOMMIT_CONFIG:-$ROOT_DIR/.autocom.conf}"
+
+if [ ! -d "$ROOT_DIR/.git" ]; then
+  echo "Not a git repository: $ROOT_DIR"
+  exit 1
+fi
+
+AUTOCOMMIT_DEBOUNCE_SECONDS=30
+AUTOCOMMIT_PROTECTED_BRANCHES="main master production"
+AUTOCOMMIT_MIN_LINES=8
+AUTOCOMMIT_PUSH=true
+AUTOCOMMIT_AUTO_ADD=true
+AUTOCOMMIT_IGNORE_GLOBS=".git .idea .vscode .cursor .claude .gemini .chatgpt tmp logs"
+AUTOCOMMIT_BUILTIN_PATH_RULES=true
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+cd "$ROOT_DIR"
+
+require_dependency() {
+  local cmd="$1"
+  local reason="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing dependency: $cmd ($reason)"
+    return 1
+  fi
+  return 0
+}
+
+check_dependencies() {
+  local failed=false
+  require_dependency git "required for repository and commit operations" || failed=true
+  require_dependency rg "required for path and diff classification rules" || failed=true
+  if [ "$failed" = true ]; then
+    echo "Install missing dependencies and try again."
+    exit 1
+  fi
+}
+
+to_lower() {
+  printf "%s" "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+in_space_separated_list() {
+  local needle="$1"
+  shift
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+current_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || printf ""
+}
+
+is_protected_branch() {
+  local branch="$1"
+  read -r -a branches <<< "$AUTOCOMMIT_PROTECTED_BRANCHES"
+  in_space_separated_list "$branch" "${branches[@]}"
+}
+
+has_tracked_changes() {
+  [ -n "$(git status --porcelain --untracked-files=no)" ]
+}
+
+auto_add_all() {
+  if [ "$AUTOCOMMIT_AUTO_ADD" = true ]; then
+    git add .
+  fi
+}
+
+staged_has_substantive_changes() {
+  ! git diff --cached -w --quiet
+}
+
+changed_line_count() {
+  git diff --cached --numstat | awk '
+    {
+      add=$1; del=$2;
+      if (add == "-" || del == "-") next;
+      sum += add + del
+    }
+    END { print sum + 0 }
+  '
+}
+
+semantic_type_custom_path_rules() {
+  local lower_files="$1"
+  local line typ pat path
+  [ -z "${AUTOCOMMIT_PATH_RULES:-}" ] && return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+    [[ "$line" == \#* ]] && continue
+    [[ "$line" != *:* ]] && continue
+    typ="${line%%:*}"
+    pat="${line#*:}"
+    typ="$(to_lower "${typ//[[:space:]]/}")"
+    pat="${pat#"${pat%%[![:space:]]*}"}"
+    pat="${pat%"${pat##*[![:space:]]}"}"
+    if [ -z "$typ" ] || [ -z "$pat" ]; then
+      continue
+    fi
+    while IFS= read -r path || [ -n "$path" ]; do
+      path="${path#"${path%%[![:space:]]*}"}"
+      path="${path%"${path##*[![:space:]]}"}"
+      [ -z "$path" ] && continue
+      if printf "%s" "$path" | rg -q "$pat" 2>/dev/null; then
+        printf "%s" "$typ"
+        return 0
+      fi
+    done <<< "$(printf "%s\n" "$lower_files")"
+  done <<< "$(printf "%s\n" "$AUTOCOMMIT_PATH_RULES")"
+  return 1
+}
+
+semantic_type_builtin_path_rules() {
+  local lower_files="$1"
+
+  if printf "%s" "$lower_files" | rg -q "(^|/)(readme|changelog|contributing|license)(\.|$)|\.md$|^docs/|^doc/|^todo\.md$"; then
+    printf "chore"
+    return 0
+  fi
+
+  if printf "%s" "$lower_files" | rg -q "(^|/)(dockerfile|makefile)$|^\.github/|^\.gitlab/|^\.circleci/|(^|/)jenkinsfile$|(^|/)buildkite\.yml$|^scripts/|^ops/|^devops/|^infra/|^helm/|^k8s/|^terraform/|(^|/)\.env(\.example)?$|(^|/)compose\.ya?ml$"; then
+    printf "chore"
+    return 0
+  fi
+
+  if printf "%s" "$lower_files" | rg -q "(^|/)package(-lock)?\.json$|(^|/)pnpm-lock\.yaml$|(^|/)yarn\.lock$|(^|/)bun\.lockb$|(^|/)go\.(mod|sum|work)$|(^|/)cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)pyproject\.toml$|(^|/)poetry\.lock$|(^|/)requirements(\-dev)?\.txt$|(^|/)pipfile(\.lock)?$|(^|/)pom\.xml$|(^|/)build\.gradle(\.kts)?$|(^|/)settings\.gradle(\.kts)?$|(^|/)composer\.(json|lock)$|(^|/)gemfile(\.lock)?$"; then
+    printf "chore"
+    return 0
+  fi
+
+  if printf "%s" "$lower_files" | rg -q "(^|/)test/|(^|/)tests/|(^|/)__tests__/|(^|/)spec/|(^|/)e2e/|(^|/)cypress/|(^|/)playwright/|\.spec\.[a-z0-9]+$|\.test\.[a-z0-9]+$"; then
+    printf "update"
+    return 0
+  fi
+
+  if printf "%s" "$lower_files" | rg -q "^cmd/|(^|/)src/main\.(ts|js)$|(^|/)src/app\.(ts|js)$|(^|/)src/bootstrap\.(ts|js)$|(^|/)src/modules/|(^|/)src/controllers/|(^|/)src/services/|(^|/)src/routes?/|(^|/)src/api/|(^|/)src/features/|(^|/)src/components/|(^|/)src/pages/|(^|/)apps/|(^|/)packages/|(^|/)crates/|(^|/)bin/|(^|/)handlers?/|(^|/)controllers?/|(^|/)services?/|(^|/)routers?/|(^|/)routes?/|(^|/)api/|(^|/)domain/|(^|/)application/|(^|/)usecases?/|(^|/)endpoints?/|(^|/)graphql/|(^|/)proto/|(^|/)migrations?/|(^|/)db/|(^|/)schema/|(^|/)repository/|(^|/)repositories/|(^|/)internal/handler/|(^|/)internal/middleware/|(^|/)internal/service/|(^|/)internal/integrations/"; then
+    printf "feat"
+    return 0
+  fi
+
+  if printf "%s" "$lower_files" | rg -q "(^|/)internal/repository/|(^|/)internal/db/|(^|/)internal/parser/|(^|/)lib/|(^|/)utils?/|(^|/)helpers?/|(^|/)shared/|(^|/)common/|(^|/)core/|(^|/)config/"; then
+    printf "update"
+    return 0
+  fi
+
+  return 1
+}
+
+semantic_type_from_diff() {
+  local files lower_files custom builtin
+  files="$(git diff --cached --name-only || true)"
+  lower_files="$(to_lower "$files")"
+
+  if custom="$(semantic_type_custom_path_rules "$lower_files")"; then
+    printf "%s" "$custom"
+    return
+  fi
+
+  if [ "$AUTOCOMMIT_BUILTIN_PATH_RULES" = true ]; then
+    if builtin="$(semantic_type_builtin_path_rules "$lower_files")"; then
+      printf "%s" "$builtin"
+      return
+    fi
+  fi
+
+  local text
+  text="$files"$'\n'"$(git diff --cached --unified=0 -- . ':(exclude)*.md' | sed -n '1,200p')"
+  local lower
+  lower="$(to_lower "$text")"
+
+  if printf "%s" "$lower" | rg -q "revert"; then
+    printf "revert"
+    return
+  fi
+
+  if printf "%s" "$lower" | rg -q "fix|bug|panic|error|nil|retry|hotfix|regress"; then
+    printf "fix"
+    return
+  fi
+
+  if printf "%s" "$lower" | rg -q "add|create|new|introduc|implement|feature|endpoint|route"; then
+    printf "feat"
+    return
+  fi
+
+  if printf "%s" "$lower" | rg -q "bump|deps|refactor|cleanup|format|lint|build|ci|script|config"; then
+    printf "chore"
+    return
+  fi
+
+  printf "update"
+}
+
+summary_from_files() {
+  local files
+  files="$(git diff --cached --name-only | sed '/^\s*$/d' || true)"
+
+  if [ -z "$files" ]; then
+    printf "repository changes"
+    return
+  fi
+
+  local first_file
+  first_file="$(printf "%s\n" "$files" | sed -n '1p')"
+  local count
+  count="$(printf "%s\n" "$files" | wc -l | tr -d ' ')"
+
+  local stem
+  stem="$(basename "$first_file")"
+  stem="${stem%.*}"
+  stem="$(printf "%s" "$stem" | tr '_' ' ' | tr '-' ' ')"
+
+  if [ "$count" -eq 1 ]; then
+    printf "%s changes" "$stem"
+  else
+    printf "%s and %s more files" "$stem" "$((count - 1))"
+  fi
+}
+
+commit_message() {
+  local type="$1"
+  local summary="$2"
+  printf "%s: %s" "$type" "$summary"
+}
+
+has_upstream() {
+  git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1
+}
+
+run_commit_cycle() {
+  local branch
+  branch="$(current_branch)"
+
+  if [ -z "$branch" ]; then
+    echo "Skip: detached HEAD."
+    return
+  fi
+
+  if is_protected_branch "$branch"; then
+    echo "Skip: protected branch '$branch'."
+    return
+  fi
+
+  auto_add_all
+
+  if git diff --cached --quiet; then
+    echo "Skip: nothing staged."
+    return
+  fi
+
+  if ! staged_has_substantive_changes; then
+    echo "Skip: whitespace/format-only changes."
+    if [ "$DRY_RUN" = false ]; then
+      git reset >/dev/null 2>&1 || true
+    fi
+    return
+  fi
+
+  local total_lines
+  total_lines="$(changed_line_count)"
+  if [ "$total_lines" -lt "$AUTOCOMMIT_MIN_LINES" ]; then
+    echo "Skip: changed lines ($total_lines) < AUTOCOMMIT_MIN_LINES ($AUTOCOMMIT_MIN_LINES)."
+    if [ "$DRY_RUN" = false ]; then
+      git reset >/dev/null 2>&1 || true
+    fi
+    return
+  fi
+
+  local type summary message
+  type="$(semantic_type_from_diff)"
+  summary="$(summary_from_files)"
+  message="$(commit_message "$type" "$summary")"
+
+  if [ "$DRY_RUN" = true ]; then
+    echo "Dry run: would commit '$message'"
+    if [ "$AUTOCOMMIT_PUSH" = true ] && has_upstream; then
+      echo "Dry run: would push '$branch'"
+    fi
+    return
+  fi
+
+  git commit -m "$message" >/dev/null
+  echo "Committed: $message"
+
+  if [ "$AUTOCOMMIT_PUSH" = true ]; then
+    if has_upstream; then
+      git push >/dev/null
+      echo "Pushed: $branch"
+    else
+      echo "Skip push: no upstream configured for '$branch'."
+    fi
+  fi
+}
+
+watch_with_fswatch() {
+  local -a excludes=()
+  for g in $AUTOCOMMIT_IGNORE_GLOBS; do
+    excludes+=("--exclude=$g")
+  done
+
+  fswatch -r "${excludes[@]}" "$ROOT_DIR" | while IFS= read -r _event; do
+    sleep "$AUTOCOMMIT_DEBOUNCE_SECONDS"
+    if has_tracked_changes; then
+      run_commit_cycle || true
+    fi
+  done
+}
+
+watch_with_polling() {
+  local last=""
+  while true; do
+    local now
+    now="$(git status --porcelain --untracked-files=no | cksum | awk '{print $1}')"
+    if [ "$now" != "$last" ]; then
+      last="$now"
+      if has_tracked_changes; then
+        sleep "$AUTOCOMMIT_DEBOUNCE_SECONDS"
+        run_commit_cycle || true
+      fi
+    fi
+    sleep 2
+  done
+}
+
+check_dependencies
+
+echo "Watching: $ROOT_DIR"
+echo "Config: $CONFIG_FILE"
+echo "Debounce: ${AUTOCOMMIT_DEBOUNCE_SECONDS}s | Protected: ${AUTOCOMMIT_PROTECTED_BRANCHES}"
+echo "Min lines: $AUTOCOMMIT_MIN_LINES | Push: $AUTOCOMMIT_PUSH"
+echo "Path rules: custom=$([ -n "${AUTOCOMMIT_PATH_RULES:-}" ] && echo yes || echo no) builtin=$AUTOCOMMIT_BUILTIN_PATH_RULES"
+if [ "$DRY_RUN" = true ]; then
+  echo "Mode: dry-run"
+fi
+
+if [ "$RUN_ONCE" = true ]; then
+  run_commit_cycle
+  exit 0
+fi
+
+if command -v fswatch >/dev/null 2>&1; then
+  watch_with_fswatch
+else
+  echo "fswatch not found. Using polling fallback."
+  watch_with_polling
+fi
