@@ -3,13 +3,14 @@
 set -euo pipefail
 
 VERSION="0.1.0"
+CLI_NAME="$(basename "$0")"
 
 show_help() {
-  cat <<'EOF'
-ac - lightweight git auto-commit watcher
+  cat <<EOF
+$CLI_NAME - lightweight git auto-commit watcher
 
 Usage:
-  ac [ROOT_DIR] [options]
+  $CLI_NAME [ROOT_DIR] [options]
 
 Arguments:
   ROOT_DIR               Repository root to watch (default: current directory)
@@ -36,7 +37,7 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     -v|--version)
-      echo "ac $VERSION"
+      echo "$CLI_NAME $VERSION"
       exit 0
       ;;
     --once)
@@ -53,7 +54,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     -*)
       echo "Unknown option: $1" >&2
-      echo "Run 'ac --help' for usage." >&2
+      echo "Run '$CLI_NAME --help' for usage." >&2
       exit 2
       ;;
     *)
@@ -62,7 +63,7 @@ while [ "$#" -gt 0 ]; do
         shift
       else
         echo "Unexpected argument: $1" >&2
-        echo "Run 'ac --help' for usage." >&2
+        echo "Run '$CLI_NAME --help' for usage." >&2
         exit 2
       fi
       ;;

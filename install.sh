@@ -3,7 +3,7 @@
 set -euo pipefail
 
 TARGET_DIR="${HOME}/.local/bin"
-TARGET="${TARGET_DIR}/ac"
+TARGET="${TARGET_DIR}/autocom"
 
 mkdir -p "$TARGET_DIR"
 cp "$(cd "$(dirname "$0")" && pwd)/ac" "$TARGET"
