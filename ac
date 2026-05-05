@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.2"
 CLI_NAME="$(basename "$0")"
 
 show_help() {
@@ -273,7 +273,85 @@ semantic_type_from_diff() {
   printf "update"
 }
 
-summary_from_files() {
+normalize_words() {
+  local text="$1"
+  text="${text//_/ }"
+  text="${text//-/ }"
+  printf "%s" "$text" | sed 's/[.]/ /g; s/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+primary_area_from_files() {
+  local files="$1"
+  local first_file first second
+  first_file="$(printf "%s\n" "$files" | sed -n '1p')"
+  first="$(printf "%s" "$first_file" | awk -F/ '{print $1}')"
+  second="$(printf "%s" "$first_file" | awk -F/ '{print $2}')"
+
+  case "$first" in
+    src|internal|app|apps|packages|crates|cmd|lib|services|modules|features|controllers|routes|api)
+      if [ -n "$second" ]; then
+        normalize_words "$second"
+      else
+        normalize_words "$first"
+      fi
+      ;;
+    *)
+      normalize_words "$first"
+      ;;
+  esac
+}
+
+subject_from_files() {
+  local files="$1"
+  local first_file stem
+  first_file="$(printf "%s\n" "$files" | sed -n '1p')"
+  stem="$(basename "$first_file")"
+  stem="${stem%.*}"
+  normalize_words "$stem"
+}
+
+action_from_diff() {
+  local type="$1"
+  local lower="$2"
+
+  if [ "$type" = "fix" ]; then
+    printf "fix"
+    return
+  fi
+  if [ "$type" = "feat" ]; then
+    printf "add"
+    return
+  fi
+  if [ "$type" = "revert" ]; then
+    printf "revert"
+    return
+  fi
+  if [ "$type" = "chore" ]; then
+    if printf "%s" "$lower" | rg -q "deps|lock|version|bump"; then
+      printf "update dependencies"
+    elif printf "%s" "$lower" | rg -q "ci|workflow|pipeline"; then
+      printf "update ci"
+    elif printf "%s" "$lower" | rg -q "config|env|docker|compose|makefile"; then
+      printf "update config"
+    else
+      printf "maintain"
+    fi
+    return
+  fi
+
+  if printf "%s" "$lower" | rg -q "refactor|cleanup|reorganize"; then
+    printf "refactor"
+  elif printf "%s" "$lower" | rg -q "test|spec|assert"; then
+    printf "update tests"
+  elif printf "%s" "$lower" | rg -q "docs|readme|changelog"; then
+    printf "update docs"
+  else
+    printf "update"
+  fi
+}
+
+summary_from_changes() {
+  local type="$1"
   local files
   files="$(git diff --cached --name-only | sed '/^\s*$/d' || true)"
 
@@ -282,20 +360,28 @@ summary_from_files() {
     return
   fi
 
-  local first_file
-  first_file="$(printf "%s\n" "$files" | sed -n '1p')"
   local count
   count="$(printf "%s\n" "$files" | wc -l | tr -d ' ')"
 
-  local stem
-  stem="$(basename "$first_file")"
-  stem="${stem%.*}"
-  stem="$(printf "%s" "$stem" | tr '_' ' ' | tr '-' ' ')"
+  local diff_text lower action area subject
+  diff_text="$(git diff --cached --unified=0 -- . ':(exclude)*.md' | sed -n '1,220p')"
+  lower="$(to_lower "$diff_text")"
+  action="$(action_from_diff "$type" "$lower")"
+  area="$(primary_area_from_files "$files")"
+  subject="$(subject_from_files "$files")"
 
   if [ "$count" -eq 1 ]; then
-    printf "%s changes" "$stem"
+    if [ -n "$area" ] && [ "$area" != "$subject" ]; then
+      printf "%s %s in %s" "$action" "$subject" "$area"
+    else
+      printf "%s %s" "$action" "$subject"
+    fi
   else
-    printf "%s and %s more files" "$stem" "$((count - 1))"
+    if [ -n "$area" ]; then
+      printf "%s %s and %s related files" "$action" "$area" "$((count - 1))"
+    else
+      printf "%s %s files" "$action" "$count"
+    fi
   fi
 }
 
@@ -350,7 +436,7 @@ run_commit_cycle() {
 
   local type summary message
   type="$(semantic_type_from_diff)"
-  summary="$(summary_from_files)"
+  summary="$(summary_from_changes "$type")"
   message="$(commit_message "$type" "$summary")"
 
   if [ "$DRY_RUN" = true ]; then

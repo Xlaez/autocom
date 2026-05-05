@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.0
+## v0.1.2
 
 - Added `autocom` CLI command for automatic commit watching.
 - Added `--help`, `--version`, `--once`, and `--dry-run` flags.
