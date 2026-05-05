@@ -71,7 +71,7 @@ git init
 git add .
 git commit -m "feat: initial ac release"
 git branch -M main
-git remote add origin git@github.com:<your-user>/autocom.git
+git remote add origin git@github.com:Xlaez/autocom.git
 git push -u origin main
 ```
 
@@ -92,7 +92,7 @@ shasum -a 256 ac-v0.1.0.tar.gz
 Or use GitHub release tarball directly:
 
 ```bash
-curl -L "https://github.com/<your-user>/autocom/archive/refs/tags/v0.1.0.tar.gz" -o v0.1.0.tar.gz
+curl -L "https://github.com/Xlaez/autocom/archive/refs/tags/v0.1.0.tar.gz" -o v0.1.0.tar.gz
 shasum -a 256 v0.1.0.tar.gz
 ```
 
@@ -115,7 +115,7 @@ git push
 Install as users:
 
 ```bash
-brew tap <your-user>/tap
+brew tap Xlaez/tap
 brew install ac
 ```
 
